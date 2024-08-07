@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebScom串口调试工具</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        #output {
+            width: 100%;
+            height: 500px;
+            margin-bottom: 10px;
+            font-family: monospace;
+        }
+        #input {
+            width: calc(100% - 300px);
+            margin-bottom: 10px;
+        }
+        button, select {
+            margin-right: 10px;
+        }
+        .control-group {
+            margin-bottom: 10px;
+        }
+        .checkbox-group {
+            display: flex;
+            flex-wrap: wrap;
+        }
+        .checkbox-group label {
+            margin-right: 15px;
+        }
+        .send-group {
+            display: flex; /* 使用flex布局使得子元素可以自适应分配空间 */
+            align-items: baseline; /* 垂直居中对齐 */
+        }
+
+        .send-group input {
+            flex-grow: 1; /* 让input元素占据可用空间 */
+            margin-right: 10px; /* 与按钮之间保持一定间距 */
+        }
+
+        .send-group button {
+            white-space: nowrap; /* 防止按钮文本换行 */
+            /* margin-left: 10px; 这行可以保留或删除，取决于您希望按钮与输入框的间距 */
+        }
+    </style>
+</head>
+<body>
+<h1>WebScom串口调试工具</h1>
+<div class="control-group">
+    <select id="baudRate">
+        <option value="9600">9600</option>
+        <option value="19200">19200</option>
+        <option value="38400">38400</option>
+        <option value="57600">57600</option>
+        <option value="115200">115200</option>
+    </select>
+    <button id="customBaudRate">更多串口设置</button>
+    <select id="dataBits">
+        <option value="8">8位数据位</option>
+        <option value="7">7位数据位</option>
+    </select>
+    <select id="parity">
+        <option value="none">无校验</option>
+        <option value="even">偶校验</option>
+        <option value="odd">奇校验</option>
+    </select>
+    <select id="stopBits">
+        <option value="1">1位停止位</option>
+        <option value="2">2位停止位</option>
+    </select>
+    <label><input type="checkbox" id="rts"> RTS</label>
+    <label><input type="checkbox" id="dtr" checked> DTR</label>
+</div>
+<div class="control-group">
+    <button id="connect">连接串口</button>
+    <button id="disconnect" disabled>断开连接</button>
+    <button id="restart" disabled>重启连接</button>
+    <label><input type="checkbox" id="hexReceive"> 16进制接收</label>
+    <label><input type="checkbox" id="addTimestamp"> 加时间戳和分包显示</label>
+    <label><input type="checkbox" id="hexSend"> 16进制发送</label>
+    <label><input type="checkbox" id="addCRLF"> 加回车换行</label>
+</div>
+<hr>
+<textarea id="output" readonly></textarea>
+<div class="send-group">
+    <input type="text" id="input" placeholder="输入要发送的数据...">
+    <button id="send" disabled>发送</button>
+</div>
+
+<script>
+    let port;
+    let currentReader = null;
+    let keepReading = true;
+    const connectButton = document.getElementById('connect');
+    const disconnectButton = document.getElementById('disconnect');
+    const restartButton = document.getElementById('restart');
+    const sendButton = document.getElementById('send');
+    const output = document.getElementById('output');
+    const input = document.getElementById('input');
+    const baudRateSelect = document.getElementById('baudRate');
+    const customBaudRateButton = document.getElementById('customBaudRate');
+    const dataBitsSelect = document.getElementById('dataBits');
+    const paritySelect = document.getElementById('parity');
+    const stopBitsSelect = document.getElementById('stopBits');
+    const rtsCheckbox = document.getElementById('rts');
+    const dtrCheckbox = document.getElementById('dtr');
+    const hexReceiveCheckbox = document.getElementById('hexReceive');
+    const hexSendCheckbox = document.getElementById('hexSend');
+    const addCRLFCheckbox = document.getElementById('addCRLF');
+    const addTimestampCheckbox = document.getElementById('addTimestamp');
+
+    customBaudRateButton.addEventListener('click', () => {
+        const customBaudRate = prompt("请输入自定义波特率：");
+        if (customBaudRate && !isNaN(customBaudRate)) {
+            const option = new Option(customBaudRate, customBaudRate);
+            baudRateSelect.add(option);
+            baudRateSelect.value = customBaudRate;
+        }
+    });
+
+    async function connectPort() {
+        try {
+            port = await navigator.serial.requestPort();
+            await port.open({
+                baudRate: parseInt(baudRateSelect.value),
+                dataBits: parseInt(dataBitsSelect.value),
+                parity: paritySelect.value,
+                stopBits: parseInt(stopBitsSelect.value)
+            });
+
+            connectButton.disabled = true;
+            disconnectButton.disabled = false;
+            restartButton.disabled = false;
+            sendButton.disabled = false;
+
+            await setRTSAndDTR();
+            keepReading = true;
+            readData();
+        } catch (error) {
+            console.error('连接错误:', error);
+        }
+    }
+
+    connectButton.addEventListener('click', connectPort);
+
+    async function disconnectPort() {
+        if (port) {
+            keepReading = false;
+            if (currentReader) {
+                await currentReader.cancel();
+            }
+            await port.close();
+            port = null;
+
+            connectButton.disabled = false;
+            disconnectButton.disabled = true;
+            restartButton.disabled = true;
+            sendButton.disabled = true;
+        }
+    }
+
+    disconnectButton.addEventListener('click', disconnectPort);
+
+    restartButton.addEventListener('click', async () => {
+        if (port) {
+            await disconnectPort();
+            await new Promise(resolve => setTimeout(resolve, 1000)); // 等待1秒
+            await connectPort();
+        }
+    });
+
+    // 修改发送按钮的事件监听器为一个独立的函数
+    async function sendData() {
+        if (port && input.value) {
+            const writer = port.writable.getWriter();
+            try {
+                let data;
+                if (hexSendCheckbox.checked) {
+                    data = hexStringToUint8Array(input.value);
+                } else {
+                    data = new TextEncoder().encode(input.value);
+                    if (addCRLFCheckbox.checked) {
+                        data = new Uint8Array([...data, 13, 10]); // 添加回车(CR)和换行(LF)
+                    }
+                }
+                await writer.write(data);
+            } finally {
+                writer.releaseLock();
+            }
+            input.value = '';
+        }
+    }
+
+    // 将发送按钮的事件监听器更改为使用 sendData 函数
+    sendButton.addEventListener('click', sendData);
+
+    // 为输入框添加键盘事件监听器
+    input.addEventListener('keydown', async (event) => {
+        if (event.key === 'Enter' && !event.shiftKey) {
+            event.preventDefault(); // 阻止默认的回车行为（如换行）
+            await sendData();
+        }
+    });
+
+    rtsCheckbox.addEventListener('change', setRTSAndDTR);
+    dtrCheckbox.addEventListener('change', setRTSAndDTR);
+
+    async function setRTSAndDTR() {
+        if (port) {
+            await port.setSignals({
+                requestToSend: rtsCheckbox.checked,
+                dataTerminalReady: dtrCheckbox.checked
+            });
+        }
+    }
+
+    async function readData() {
+        while (keepReading && port && port.readable) {
+            try {
+                currentReader = port.readable.getReader();
+                try {
+                    while (keepReading) {
+                        const { value, done } = await currentReader.read();
+                        if (done) {
+                            break;
+                        }
+                        let outputText = '';
+                        if (addTimestampCheckbox.checked) {
+                            outputText += `[${new Date().toLocaleTimeString()}] `;
+                        }
+                        if (hexReceiveCheckbox.checked) {
+                            outputText += uint8ArrayToHexString(value) + ' ';
+                        } else {
+                            outputText += new TextDecoder().decode(value);
+                        }
+                        if (addTimestampCheckbox.checked) {
+                            outputText += '\n';
+                        }
+                        output.value += outputText;
+                        output.scrollTop = output.scrollHeight;
+                    }
+                } finally {
+                    currentReader.releaseLock();
+                }
+            } catch (error) {
+                if (keepReading) {
+                    console.error('读取错误:', error);
+                }
+            }
+        }
+        currentReader = null;
+    }
+
+    function hexStringToUint8Array(hexString) {
+        hexString = hexString.replace(/\s/g, '');
+        if (hexString.length % 2 !== 0) {
+            throw new Error('Invalid hex string');
+        }
+        const arrayBuffer = new Uint8Array(hexString.length / 2);
+        for (let i = 0; i < hexString.length; i += 2) {
+            const byteValue = parseInt(hexString.substr(i, 2), 16);
+            if (isNaN(byteValue)) {
+                throw new Error('Invalid hex string');
+            }
+            arrayBuffer[i / 2] = byteValue;
+        }
+        return arrayBuffer;
+    }
+
+    function uint8ArrayToHexString(uint8Array) {
+        return Array.from(uint8Array)
+            .map(b => b.toString(16).padStart(2, '0'))
+            .join(' ');
+    }
+</script>
+</body>
+</html>
